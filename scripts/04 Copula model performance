@@ -1,0 +1,929 @@
+library(dplyr)
+library(copula)
+library(evd)
+library(ismev)
+library(fields)
+library(readxl)
+library(lubridate)
+library(ggplot2)
+library(reshape2)  
+library(viridis)   
+library(metR)
+library(TideHarmonics)
+library(oce)
+library(extRemes)
+library(purrr)
+library(patchwork)
+library(ggplotify)
+
+
+#------------------------
+# Combining datasets 
+#------------------------
+
+data_all_sites <- bind_rows(
+  get_data_GBM(),
+  get_data_Volta(),
+  get_data_Mahanadi(),
+  get_data_Rhine(),
+  get_data_Humber()
+)
+
+
+# ------------------------------
+# Hazard pair and thresholds
+# ------------------------------
+
+thresholds_df <- data.frame(
+  Area = c("GBM Delta", "GBM Delta", "GBM Delta",
+           "Volta Delta", "Volta Delta", "Volta Delta",
+           "Mahanadi Delta", "Mahanadi Delta", "Mahanadi Delta",
+           "Rhine-Meuse Delta", "Rhine-Meuse Delta", "Rhine-Meuse Delta",
+           "Humber Estuary", "Humber Estuary", "Humber Estuary"),
+  
+  Hazard = c("Riverine and coastal flood hazard", "Coastal flood and extreme heat", "Riverine flood and extreme heat",
+             "Riverine and coastal flood hazard", "Coastal flood and extreme heat", "Riverine flood and extreme heat",
+             "Riverine and coastal flood hazard", "Coastal flood and extreme heat", "Riverine flood and extreme heat",
+             "Riverine and coastal flood hazard", "Coastal flood and extreme heat", "Riverine flood and extreme heat",
+             "Riverine and coastal flood hazard", "Coastal flood and extreme heat", "Riverine flood and extreme heat"),
+  
+  var1 = c("river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL"),
+  
+  var2 = c("sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax"),
+  
+  p1 = c(0.92, 0.87, 0.93,
+         0.94, 0.95, 0.75,
+         0.76, 0.90, 0.53,
+         0.93, 0.73, 0.87,
+         0.94, 0.89, 0.87),
+  
+  p2 = c(0.88, 0.94, 0.92,
+         0.95, 0.87, 0.83,
+         0.87, 0.91, 0.88,
+         0.85, 0.95, 0.93,
+         0.84, 0.80, 0.95)
+)
+
+
+
+# -----------
+# FUNCTION
+# -----------
+
+compute_joint_RP_matrix <- function(
+    df,
+    var1,
+    var2,
+    p1,
+    p2,
+    area_name,
+    hazard_name
+){
+  
+
+  
+  df <- df %>%
+    select(Date, all_of(var1), all_of(var2)) %>%
+    na.omit()
+
+  
+  monthly_data <- df %>%
+    mutate(
+      Year  = lubridate::year(Date),
+      Month = lubridate::month(Date)
+    ) %>%
+    group_by(Year, Month) %>%
+    summarise(
+      v1 = max(.data[[var1]], na.rm = TRUE),
+      v2 = max(.data[[var2]], na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  fit1 <- gev.fit(
+    monthly_data$v1,
+    show = FALSE
+  )
+  
+  fit2 <- gev.fit(
+    monthly_data$v2,
+    show = FALSE
+  )
+  
+
+  
+  th1 <- quantile(
+    df[[var1]],
+    probs = p1,
+    na.rm = TRUE
+  )
+  
+  th2 <- quantile(
+    df[[var2]],
+    probs = p2,
+    na.rm = TRUE
+  )
+  
+
+  compound_data <- df %>%
+    filter(
+      .data[[var1]] > th1,
+      .data[[var2]] > th2
+    )
+  
+  if(nrow(compound_data) < 20){
+    
+    warning(
+      paste(
+        "Too few compound events:",
+        area_name,
+        hazard_name
+      )
+    )
+    
+    return(NULL)
+    
+  }
+  
+
+
+n <- nrow(compound_data)
+
+u <- rank(compound_data[[var1]],
+          ties.method = "average") / (n + 1)
+
+v <- rank(compound_data[[var2]],
+          ties.method = "average") / (n + 1)
+
+uv <- cbind(u, v)
+
+uv <- uv[
+  complete.cases(uv),
+]
+
+
+fit_clayton <- fitCopula(
+  claytonCopula(dim = 2),
+  uv,
+  method = "ml"
+)
+
+cop_clayton <- claytonCopula(
+  coef(fit_clayton),
+  dim = 2
+)
+
+
+
+fit_gumbel <- fitCopula(
+  gumbelCopula(dim = 2),
+  uv,
+  method = "ml"
+)
+
+cop_gumbel <- gumbelCopula(
+  coef(fit_gumbel),
+  dim = 2
+)
+
+
+
+fit_frank <- fitCopula(
+  frankCopula(dim = 2),
+  uv,
+  method = "ml",
+  start = c(2)
+)
+
+cop_frank <- frankCopula(
+  coef(fit_frank),
+  dim = 2
+)
+
+
+
+fit_amh <- fitCopula(
+  amhCopula(dim = 2),
+  uv,
+  method = "ml",
+  start = c(0.2)
+)
+
+cop_amh <- amhCopula(
+  coef(fit_amh),
+  dim = 2
+)
+  
+
+
+# -------------------------------------
+# Copula parameter uncertainty analysis
+# -------------------------------------
+
+get_ci <- function(fit){
+  
+  est <- coef(fit)
+  
+  se <- tryCatch(
+    sqrt(diag(vcov(fit))),
+    error = function(e) NA_real_
+  )
+  
+  lower <- est - 1.96 * se
+  upper <- est + 1.96 * se
+  
+  data.frame(
+    Parameter = est,
+    SE = se,
+    CI_lower = lower,
+    CI_upper = upper
+  )
+  
+}
+
+uv <- uv[complete.cases(uv),]
+
+# ------------------
+# Independence test
+# ------------------
+
+kendall_test <- cor.test(
+  compound_data[[var1]],
+  compound_data[[var2]],
+  method = "kendall"
+)
+
+independence_pvalue <- kendall_test$p.value
+
+# ----------------
+# Model comparison
+# ----------------
+
+copula_stats <- data.frame(
+  
+  Area = area_name,
+  
+  Hazard = hazard_name,
+  
+  N = nrow(compound_data),
+  
+  Threshold1 = p1,
+  
+  Threshold2 = p2,
+  
+  Independence_p = independence_pvalue,
+  
+  Copula = c(
+    "Clayton",
+    "Gumbel",
+    "Frank",
+    "AMH"
+  ),
+  
+  Parameter = c(
+    coef(fit_clayton),
+    coef(fit_gumbel),
+    coef(fit_frank),
+    coef(fit_amh)
+  ),
+  
+  LogLik = c(
+    as.numeric(logLik(fit_clayton)),
+    as.numeric(logLik(fit_gumbel)),
+    as.numeric(logLik(fit_frank)),
+    as.numeric(logLik(fit_amh))
+  ),
+  
+  AIC = c(
+    AIC(fit_clayton),
+    AIC(fit_gumbel),
+    AIC(fit_frank),
+    AIC(fit_amh)
+  ),
+  
+  BIC = c(
+    BIC(fit_clayton),
+    BIC(fit_gumbel),
+    BIC(fit_frank),
+    BIC(fit_amh)
+  )
+  
+)
+
+copula_stats$DeltaAIC <-
+  copula_stats$AIC -
+  min(copula_stats$AIC)
+
+copula_stats$DeltaBIC <-
+  copula_stats$BIC -
+  min(copula_stats$BIC)
+
+copula_stats$AkaikeWeight <-
+  exp(-0.5 * copula_stats$DeltaAIC)
+
+copula_stats$AkaikeWeight <-
+  copula_stats$AkaikeWeight /
+  sum(copula_stats$AkaikeWeight)
+
+copula_stats$Independence_rejected <-
+  independence_pvalue < 0.05
+
+ci_clayton <- get_ci(fit_clayton)
+ci_gumbel  <- get_ci(fit_gumbel)
+ci_frank   <- get_ci(fit_frank)
+ci_amh     <- get_ci(fit_amh)
+
+copula_stats$SE <- c(
+  ci_clayton$SE,
+  ci_gumbel$SE,
+  ci_frank$SE,
+  ci_amh$SE
+)
+
+copula_stats$CI_lower <- c(
+  ci_clayton$CI_lower,
+  ci_gumbel$CI_lower,
+  ci_frank$CI_lower,
+  ci_amh$CI_lower
+)
+
+copula_stats$CI_upper <- c(
+  ci_clayton$CI_upper,
+  ci_gumbel$CI_upper,
+  ci_frank$CI_upper,
+  ci_amh$CI_upper
+)
+
+
+  # --------------
+  # Best copula
+  # --------------
+  
+  models <- list(
+    
+    Clayton = list(
+      fit = fit_clayton,
+      cop = cop_clayton
+    ),
+    
+    Gumbel = list(
+      fit = fit_gumbel,
+      cop = cop_gumbel
+    ),
+    
+    Frank = list(
+      fit = fit_frank,
+      cop = cop_frank
+    ),
+    
+    AMH = list(
+      fit = fit_amh,
+      cop = cop_amh
+    )
+    
+  )
+aic_values <- sapply(
+  models,
+  function(x) AIC(x$fit)
+)
+
+best_model <- names(
+  which.min(aic_values)
+)
+
+cop_fit <- models[[best_model]]$cop
+
+
+  qgev_custom <- function(rp, fit){
+    
+    p <- 1 - 1/rp
+    
+    qgev(
+      p,
+      loc   = fit$mle[1],
+      scale = fit$mle[2],
+      shape = fit$mle[3]
+    )
+    
+  }
+  cop_fit <- models[[best_model]]$cop
+  tail_dep <- NA
+  
+  if(best_model == "Gumbel"){
+    
+    theta <- coef(models[[best_model]]$fit)
+    
+    tail_dep <- 2 - 2^(1/theta)
+    
+  }
+  
+  if(best_model == "Clayton"){
+    
+    tail_dep <- 0
+    
+  }
+  
+  if(best_model %in% c("Frank","AMH")){
+    
+    tail_dep <- 0
+    
+  }
+
+  
+  # --------------------
+  # Goodness of fit test
+  # --------------------
+  
+  gof_result <- tryCatch(
+    
+    gofCopula(
+      cop_fit,
+      x = uv,
+      simulation = "pb",
+      estim.method = "ml",
+      N = 500
+    ),
+    
+    error = function(e) NULL
+    
+  )
+  
+  gof_pvalue <- NA
+  
+  if(!is.null(gof_result))
+    gof_pvalue <- gof_result$p.value
+  
+  copula_stats$GOF_pvalue <- gof_pvalue
+  
+  
+  tail_dep <- NA
+  
+  if(best_model == "Gumbel"){
+    
+    theta <- coef(models[[best_model]]$fit)
+    
+    tail_dep <- 2 - 2^(1/theta)
+    
+  }
+  
+  if(best_model %in% c(
+    "Clayton",
+    "Frank",
+    "AMH"
+  )){
+    tail_dep <- 0
+  }
+  
+  copula_stats$UpperTailDependence <- tail_dep
+  
+  
+  #7. GEV diagnostics
+  dir.create(
+    "GEV_Diagnostics",
+    showWarnings = FALSE
+  )
+  
+  png(
+    paste0(
+      "GEV_Diagnostics/",
+      area_name,
+      "_",
+      gsub(" ","_",hazard_name),
+      "_var1.png"
+    ),
+    width = 1400,
+    height = 1400,
+    res = 200
+  )
+  
+  gev.diag(fit1)
+  
+  dev.off()
+  
+  png(
+    paste0(
+      "GEV_Diagnostics/",
+      area_name,
+      "_",
+      gsub(" ","_",hazard_name),
+      "_var2.png"
+    ),
+    width = 1400,
+    height = 1400,
+    res = 200
+  )
+  
+  gev.diag(fit2)
+  
+  dev.off()
+  
+  
+  #8. PIT diagnostics
+  pit1 <- pgev(
+    monthly_data$v1,
+    loc = fit1$mle[1],
+    scale = fit1$mle[2],
+    shape = fit1$mle[3]
+  )
+  
+  pit2 <- pgev(
+    monthly_data$v2,
+    loc = fit2$mle[1],
+    scale = fit2$mle[2],
+    shape = fit2$mle[3]
+  )
+  png(
+    paste0(
+      "GEV_Diagnostics/",
+      area_name,
+      "_",
+      gsub(" ","_",hazard_name),
+      "_PIT.png"
+    ),
+    width = 1400,
+    height = 700,
+    res = 200
+  )
+  
+  par(mfrow=c(1,2))
+  
+  hist(
+    pit1,
+    main = "PIT Variable 1",
+    xlab = "Probability"
+  )
+  
+  hist(
+    pit2,
+    main = "PIT Variable 2",
+    xlab = "Probability"
+  )
+  
+  dev.off()
+  
+  # --------
+  # JRPs
+  # --------
+  
+  RP_vals <- c(
+    5,
+    10,
+    20,
+    25,
+    30,
+    50,
+    100
+  )
+  
+  result <- expand.grid(
+    RP1 = RP_vals,
+    RP2 = RP_vals
+  )
+  
+  result <- result %>%
+    rowwise() %>%
+    mutate(
+      
+      RL1 = qgev_custom(
+        RP1,
+        fit1
+      ),
+      
+      RL2 = qgev_custom(
+        RP2,
+        fit2
+      ),
+      
+      u1 = pgev(
+        RL1,
+        loc = fit1$mle[1],
+        scale = fit1$mle[2],
+        shape = fit1$mle[3]
+      ),
+      
+      u2 = pgev(
+        RL2,
+        loc = fit2$mle[1],
+        scale = fit2$mle[2],
+        shape = fit2$mle[3]
+      ),
+      
+      C_uv = pCopula(
+        c(u1,u2),
+        cop_fit
+      ),
+      
+      joint_prob = pmax(
+        1 - u1 - u2 + C_uv,
+        1e-10
+      ),
+      
+      JointRP = 1 / joint_prob
+      
+    ) %>%
+    ungroup()
+  
+  result$Area <- area_name
+  result$Hazard <- hazard_name
+  result$Copula <- best_model
+  
+  result$Parameter <-
+    as.numeric(
+      coef(
+        models[[best_model]]$fit
+      )
+    )
+  
+  result$UpperTailDependence <-
+    tail_dep
+  
+  result$N <- nrow(compound_data) 
+  return(
+    list(
+      RP = result,
+      stats = copula_stats,
+      events = compound_data,
+      
+      GEV = list(
+        fit1 = fit1,
+        fit2 = fit2,
+        monthly_data = monthly_data,
+        var1 = var1,
+        var2 = var2,
+        area = area_name,
+        hazard = hazard_name
+      ),
+      
+      PIT = list(
+        pit1 = pit1,
+        pit2 = pit2,
+        area = area_name,
+        hazard = hazard_name,
+        var1 = var1,
+        var2 = var2
+      )
+    )
+  )
+  
+}
+ 
+
+all_gev <- list()
+
+all_pit <- list()
+
+# ----------------
+# Applications
+# ----------------
+
+all_RP <- data.frame()
+
+copula_summary <- data.frame()
+
+all_compound_events <- data.frame()
+
+for(i in seq_len(nrow(thresholds_df))){
+  
+  row <- thresholds_df[i,]
+  
+  df_area <- data_all_sites %>%
+    filter(
+      Area == row$Area
+    )
+  
+  res <- compute_joint_RP_matrix(
+    
+    df = df_area,
+    
+    var1 = row$var1,
+    
+    var2 = row$var2,
+    
+    p1 = row$p1,
+    
+    p2 = row$p2,
+    
+    area_name = row$Area,
+    
+    hazard_name = row$Hazard
+    
+  )
+  
+  if(is.null(res))
+    next
+  
+  all_RP <- bind_rows(
+    all_RP,
+    res$RP
+  )
+  
+  copula_summary <- bind_rows(
+    copula_summary,
+    res$stats
+  )
+  
+  all_compound_events <- bind_rows(
+    all_compound_events,
+    res$events
+  )
+  all_gev[[paste(
+    row$Area,
+    row$Hazard,
+    sep = "_"
+  )]] <- res$GEV
+  
+  all_pit[[paste(
+    row$Area,
+    row$Hazard,
+    sep = "_"
+  )]] <- res$PIT
+  
+}
+
+
+
+
+# ---------------
+# Visualisation
+# ---------------
+
+for (area_i in areas) {
+  
+  area_plots <- Filter(
+    function(x) identical(x$area, area_i),
+    all_gev
+  )
+  
+  if (length(area_plots) == 0) {
+    warning("No GEV diagnostics found for: ", area_i)
+    next
+  }
+  
+  diagnostic_plots <- list()
+  
+  for (j in seq_along(area_plots)) {
+    
+    x <- area_plots[[j]]
+    
+    hazard_label <- x$hazard
+    
+    # Variable 1 diagnostic
+    g1 <- ggplotify::as.ggplot(
+      function() {
+        ismev::gev.diag(x$fit1)
+      }
+    ) +
+      labs(
+        title = paste0(hazard_label, "\nVariable 1: ", x$var1)
+      ) +
+      theme(
+        plot.title = element_text(
+          face = "bold",
+          size = 10,
+          hjust = 0.5
+        )
+      )
+    
+    g2 <- ggplotify::as.ggplot(
+      function() {
+        ismev::gev.diag(x$fit2)
+      }
+    ) +
+      labs(
+        title = paste0(hazard_label, "\nVariable 2: ", x$var2)
+      ) +
+      theme(
+        plot.title = element_text(
+          face = "bold",
+          size = 10,
+          hjust = 0.5
+        )
+      )
+    
+    diagnostic_plots[[length(diagnostic_plots) + 1]] <- g1
+    diagnostic_plots[[length(diagnostic_plots) + 1]] <- g2
+  }
+  
+  regional_figure <- wrap_plots(
+    diagnostic_plots,
+    ncol = 2,
+    byrow = TRUE
+  ) +
+    plot_annotation(
+      title = paste("GEV Diagnostic Plots:", area_i),
+      theme = theme(
+        plot.title = element_text(
+          face = "bold",
+          size = 15,
+          hjust = 0.5
+        )
+      )
+    )
+  
+  area_file <- gsub("[^A-Za-z0-9]+", "_", area_i)
+  
+  ggsave(
+    filename = file.path(
+      out_dir,
+      paste0("GEV_", area_file, ".pdf")
+    ),
+    plot = regional_figure,
+    width = 14,
+    height = max(8, 4.5 * length(area_plots)),
+    units = "in",
+    device = "pdf",
+    limitsize = FALSE
+  )
+  
+  ggsave(
+    filename = file.path(
+      out_dir,
+      paste0("GEV_", area_file, ".jpg")
+    ),
+    plot = regional_figure,
+    width = 14,
+    height = max(8, 4.5 * length(area_plots)),
+    units = "in",
+    dpi = 400,
+    limitsize = FALSE
+  )
+}
+
+
+
+figure_names <- paste0(
+  "Figure_S",
+  12:16,
+  "_PIT_"
+)
+
+for(k in seq_along(areas)){
+  
+  area_i <- areas[k]
+  
+  area_plots <- all_pit[
+    grep(
+      area_i,
+      names(all_pit)
+    )
+  ]
+  
+  jpeg(
+    paste0(
+      figure_names[k],
+      gsub(" ","_",area_i),
+      ".jpg"
+    ),
+    width = 12,
+    height = 9,
+    units = "in",
+    res = 400
+  )
+  
+  par(
+    mfrow = c(3,2),
+    mar = c(4,4,3,1)
+  )
+  
+  for(j in seq_along(area_plots)){
+    
+    hist(
+      area_plots[[j]]$pit1,
+      main = paste(
+        substr(
+          area_plots[[j]]$hazard,
+          1,
+          30
+        ),
+        "\nVar1"
+      ),
+      xlab = "PIT",
+      col = "grey80"
+    )
+    
+    hist(
+      area_plots[[j]]$pit2,
+      main = paste(
+        substr(
+          area_plots[[j]]$hazard,
+          1,
+          30
+        ),
+        "\nVar2"
+      ),
+      xlab = "PIT",
+      col = "grey80"
+    )
+    
+  }
+  
+  dev.off()
+}
+
