@@ -1,0 +1,415 @@
+library(dplyr)
+library(purrr)
+library(copula)
+library(evd)
+library(ismev)
+library(fields)
+library(readxl)
+library(lubridate)
+library(ggplot2)
+library(reshape2)  
+library(viridis)   
+library(metR)
+library(TideHarmonics)
+library(oce)
+
+
+#-------------------
+#Combining datasets
+#-------------------
+data_all_sites <- bind_rows(
+  get_data_GBM(),
+  get_data_Volta(),
+  get_data_Mahanadi(),
+  get_data_Rhine(),
+  get_data_Humber()
+)
+
+#-----------------------------------
+#Functions
+#-----------------------------------
+
+
+detect_joint_extremes_cv <- function(
+    df,
+    var1,
+    var2,
+    p_seq = seq(0.50, 0.95, 0.01),
+    n_folds = 10,
+    min_joint_train = 20,
+    min_joint_test = 5,
+    seed = 123
+) {
+  
+  df_pair <- df %>%
+    select(all_of(var1), all_of(var2)) %>%
+    na.omit()
+  
+  if(nrow(df_pair) < 30){
+    warning(paste("Not enough data for", var1, "-", var2))
+    return(NULL)
+  }
+  
+  results <- expand.grid(
+    p1 = p_seq,
+    p2 = p_seq
+  )
+  
+  results$tau <- NA_real_
+  results$n_joint <- NA_integer_
+  
+  for(i in seq_len(nrow(results))) {
+    
+    p1 <- results$p1[i]
+    p2 <- results$p2[i]
+    
+    th1 <- quantile(df_pair[[var1]], p1, na.rm = TRUE)
+    th2 <- quantile(df_pair[[var2]], p2, na.rm = TRUE)
+    
+    temp <- df_pair %>%
+      filter(
+        .data[[var1]] > th1,
+        .data[[var2]] > th2
+      )
+    
+    results$n_joint[i] <- nrow(temp)
+    
+    if(nrow(temp) >= min_joint_train) {
+      
+      results$tau[i] <- cor(
+        temp[[var1]],
+        temp[[var2]],
+        method = "kendall",
+        use = "complete.obs"
+      )
+      
+    }
+  }
+  
+  valid_results <- results %>%
+    filter(
+      !is.na(tau),
+      n_joint >= min_joint_train
+    )
+  
+  if(nrow(valid_results) == 0) {
+    
+    warning(
+      paste(
+        "No valid threshold combinations found for",
+        var1, "-", var2
+      )
+    )
+    
+    return(NULL)
+  }
+  
+  best <- valid_results %>%
+    filter(tau == max(tau, na.rm = TRUE)) %>%
+    slice(1)
+  
+  # 10-fold cross-validation
+  set.seed(seed)
+  
+  n <- nrow(df_pair)
+  
+  folds <- sample(rep(1:n_folds,
+                      length.out = n))
+  
+  cv_results <- data.frame()
+  
+  for(f in 1:n_folds) {
+    
+    train_df <- df_pair[folds != f, ]
+    test_df  <- df_pair[folds == f, ]
+    
+    train_grid <- expand.grid(
+      p1 = p_seq,
+      p2 = p_seq
+    )
+    
+    train_grid$tau_train <- NA_real_
+    train_grid$n_joint_train <- NA_integer_
+    
+    # Optimize on training data
+    for(j in seq_len(nrow(train_grid))) {
+      
+      p1 <- train_grid$p1[j]
+      p2 <- train_grid$p2[j]
+      
+      th1 <- quantile(train_df[[var1]], p1, na.rm = TRUE)
+      th2 <- quantile(train_df[[var2]], p2, na.rm = TRUE)
+      
+      temp <- train_df %>%
+        filter(
+          .data[[var1]] > th1,
+          .data[[var2]] > th2
+        )
+      
+      train_grid$n_joint_train[j] <- nrow(temp)
+      
+      if(nrow(temp) >= min_joint_train) {
+        
+        train_grid$tau_train[j] <- cor(
+          temp[[var1]],
+          temp[[var2]],
+          method = "kendall",
+          use = "complete.obs"
+        )
+        
+      }
+    }
+    
+    valid_fold <- train_grid %>%
+      filter(
+        !is.na(tau_train),
+        n_joint_train >= min_joint_train
+      )
+    
+    if(nrow(valid_fold) == 0)
+      next
+    
+    best_fold <- valid_fold %>%
+      filter(
+        tau_train ==
+          max(tau_train, na.rm = TRUE)
+      ) %>%
+      slice(1)
+    
+    # Test performance
+    th1 <- quantile(
+      train_df[[var1]],
+      best_fold$p1,
+      na.rm = TRUE
+    )
+    
+    th2 <- quantile(
+      train_df[[var2]],
+      best_fold$p2,
+      na.rm = TRUE
+    )
+    
+    test_joint <- test_df %>%
+      filter(
+        .data[[var1]] > th1,
+        .data[[var2]] > th2
+      )
+    
+    tau_test <- NA
+    
+    if(nrow(test_joint) >= min_joint_test) {
+      
+      tau_test <- cor(
+        test_joint[[var1]],
+        test_joint[[var2]],
+        method = "kendall",
+        use = "complete.obs"
+      )
+      
+    }
+    
+    cv_results <- bind_rows(
+      cv_results,
+      data.frame(
+        Fold = f,
+        p1 = best_fold$p1,
+        p2 = best_fold$p2,
+        tau_train = best_fold$tau_train,
+        tau_test = tau_test,
+        n_train_joint = best_fold$n_joint_train,
+        n_test_joint = nrow(test_joint)
+      )
+    )
+    
+  }
+  
+  cv_summary <- data.frame(
+    valid_folds = sum(!is.na(cv_results$tau_test)),
+    mean_tau_test =
+      mean(cv_results$tau_test,
+           na.rm = TRUE),
+    sd_tau_test =
+      sd(cv_results$tau_test,
+         na.rm = TRUE),
+    median_tau_test =
+      median(cv_results$tau_test,
+             na.rm = TRUE)
+  )
+  
+  return(
+    list(
+      results = results,
+      best = best,
+      cv_results = cv_results,
+      cv_summary = cv_summary
+    )
+  )
+}
+
+#--------------------
+#hazard wrappers
+#--------------------
+analyze_RC <- function(df){
+  
+  out <- detect_joint_extremes_cv(
+    df,
+    "river_WL",
+    "sea_level"
+  )
+  
+  if(is.null(out)) return(NULL)
+  
+  out$results$Hazard <- "Riverine and coastal flood hazard"
+  out$best$Hazard <- "Riverine and coastal flood hazard"
+  out$cv_results$Hazard <- "Riverine and coastal flood hazard"
+  
+  return(out)
+}
+
+analyze_CH <- function(df){
+  
+  out <- detect_joint_extremes_cv(
+    df,
+    "sea_level",
+    "Tmax"
+  )
+  
+  if(is.null(out)) return(NULL)
+  
+  out$results$Hazard <- "Coastal flood and extreme heat"
+  out$best$Hazard <- "Coastal flood and extreme heat"
+  out$cv_results$Hazard <- "Coastal flood and extreme heat"
+  
+  return(out)
+}
+analyze_RH <- function(df){
+  
+  out <- detect_joint_extremes_cv(
+    df,
+    "river_WL",
+    "Tmax"
+  )
+  
+  if(is.null(out)) return(NULL)
+  
+  out$results$Hazard <- "Riverine flood and extreme heat"
+  out$best$Hazard <- "Riverine flood and extreme heat"
+  out$cv_results$Hazard <- "Riverine flood and extreme heat"
+  
+  return(out)
+}
+
+#--------------------------
+#Apply across all areas
+#--------------------------
+results_all <- data.frame()
+best_all <- data.frame()
+cv_all <- data.frame()
+cv_summary_all <- data.frame()
+
+for(area in unique(data_all_sites$Area)) {
+  
+  df <- data_all_sites %>%
+    filter(Area == area)
+  
+  rc <- analyze_RC(df)
+  ch <- analyze_CH(df)
+  rh <- analyze_RH(df)
+  
+  tmp_results <- bind_rows(
+    rc$results,
+    ch$results,
+    rh$results
+  ) %>%
+    mutate(Area = area)
+  
+  tmp_best <- bind_rows(
+    rc$best,
+    ch$best,
+    rh$best
+  ) %>%
+    mutate(Area = area)
+  
+  tmp_cv <- bind_rows(
+    rc$cv_results,
+    ch$cv_results,
+    rh$cv_results
+  ) %>%
+    mutate(Area = area)
+  
+  tmp_cv_summary <- bind_rows(
+    rc$cv_summary,
+    ch$cv_summary,
+    rh$cv_summary
+  )
+  
+  tmp_cv_summary$Hazard <- c(
+    "Riverine and coastal flood hazard",
+    "Coastal flood and extreme heat",
+    "Riverine flood and extreme heat"
+  )
+  
+  tmp_cv_summary$Area <- area
+  
+  results_all <- bind_rows(results_all, tmp_results)
+  best_all <- bind_rows(best_all, tmp_best)
+  cv_all <- bind_rows(cv_all, tmp_cv)
+  cv_summary_all <- bind_rows(cv_summary_all, tmp_cv_summary)
+}
+
+#---------------
+#Diagnosis 
+#---------------
+
+cv_all %>%
+  group_by(Area, Hazard) %>%
+  summarise(
+    valid_folds = sum(!is.na(tau_test)),
+    mean_tau = mean(tau_test, na.rm=TRUE),
+    mean_events = mean(n_test_joint, na.rm=TRUE)
+  )
+
+
+#---------------------------------
+#Visualization
+#---------------------------------
+
+
+ggplot(results_all, aes(p1, p2, fill = tau)) +
+  geom_tile() +
+  scale_fill_viridis_c(
+    option = "rocket",
+    direction = -1,
+    na.value = "grey90"
+  ) +xlim(0.49,1)+ylim(0.49,1)+
+  facet_grid(Area ~ Hazard) +    
+  geom_text(data = facet_labels, aes(x = 1, y = Inf, label = panel_label),
+            inherit.aes = FALSE,
+            hjust = 1,
+            vjust = 1,
+            fontface = "bold",
+            size = 4
+  )+
+  coord_equal() +
+  
+  geom_point(data = optimised_tau,
+             aes(p1, p2, color = legend_label),
+             size = 2) +
+  scale_color_manual(
+    name = "",
+    values = c("Optimal thresholds" = "green")
+  )+
+  
+  labs(
+    x = "Percentile (Hazard 1)",
+    y = "Percentile (Hazard 2)",
+    fill = "Dependency (τ)"
+  ) +
+  theme_bw() +
+  theme(
+    strip.text = element_text(face = "bold", size = 8.5),
+    strip.background = element_blank(),
+    axis.text = element_text(size = 8),
+    legend.position = "bottom"
+  )
+
