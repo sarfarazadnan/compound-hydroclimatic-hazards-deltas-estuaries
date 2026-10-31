@@ -1,0 +1,114 @@
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(ggplot2)
+
+#--------------------
+#Monthly statistics
+#--------------------
+compute_monthly_stats_full <- function(df, area_name, pair_name) {
+  
+  df <- df %>%
+    mutate(
+      Date = as.Date(Date),
+      Year = lubridate::year(Date),
+      Month = lubridate::month(Date)
+    )
+  
+  n_years <- n_distinct(df$Year)
+  
+  extreme_df <- df %>%
+    filter(joint_extreme == TRUE)
+  
+  monthly_counts <- extreme_df %>%
+    group_by(Month) %>%
+    summarise(total_events = n(), .groups = "drop") %>%
+    complete(Month = 1:12, fill = list(total_events = 0))
+  
+  monthly_stats <- monthly_counts %>%
+    mutate(
+      rate = total_events / n_years,
+      lower_ci = qpois(0.025, total_events) / n_years,
+      upper_ci = qpois(0.975, total_events) / n_years,
+      Area = area_name,
+      Pair = pair_name
+    )
+  
+  return(monthly_stats)
+}
+
+
+#-----------------------
+#Visualization
+#-----------------------
+area_order <- c("GBM Delta","Mahanadi Delta", "Volta Delta", "Rhine-Meuse Delta", "Humber Estuary")
+
+monthly_stats_all$Pair <- factor(
+  monthly_stats_all$Pair,
+  levels = c(
+    "Riverine and coastal flood hazard",
+    "Coastal flood and extreme heat",
+    "Riverine flood and extreme heat"
+  )
+)
+
+monthly_stats_all <- monthly_stats_all %>%
+  mutate(
+    Pair = recode(
+      Pair,
+      "Riverine and coastal flood hazard" = "Riverine(H1)-coastal(H2) flood",
+      "Coastal flood and extreme heat" = "Coastal flood(H1)-extreme heat(H2)",
+      "Riverine flood and extreme heat" = "Riverine flood(H1)-extreme heat(H2)"
+    )
+  )
+monthly_stats_all$Area <- factor(
+  monthly_stats_all$Area,
+  levels = area_order
+)
+
+facet_labels <- expand.grid(
+  Area = levels(monthly_stats_all$Area),
+  Pair = levels(monthly_stats_all$Pair)
+)
+
+facet_labels$panel_label <- paste0(
+  letters[1:nrow(facet_labels)], "."
+)
+
+ggplot(monthly_stats_all,
+       aes(x = factor(Month, levels=1:12, labels=month.abb),
+           y = rate)) +
+  
+  geom_bar(stat = "identity", fill = "#440154FF") +
+  
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci),
+                width = 0.2, colour = "#3CBB75FF") +
+  
+  facet_grid(Area~Pair) +
+  geom_text(
+    data = facet_labels,
+    aes(
+      x = 1,
+      y = Inf,
+      label = panel_label
+    ),
+    inherit.aes = FALSE,
+    hjust = -0.2,
+    vjust = 1.5,
+    fontface = "bold",
+    size = 3
+  )+
+  
+  labs(
+    x = "Month",
+    y = "Average number of compound-event days"
+  ) +
+  
+  theme_bw() +
+  theme(
+    strip.text = element_text(face = "bold", size = 8.5),
+    strip.background = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+
