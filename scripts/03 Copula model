@@ -1,0 +1,512 @@
+library(dplyr)
+library(copula)
+library(evd)
+library(ismev)
+library(fields)
+library(readxl)
+library(lubridate)
+library(ggplot2)
+library(reshape2)  
+library(viridis)   
+library(metR)
+library(TideHarmonics)
+library(oce)
+library(extRemes)
+library(purrr)
+
+
+#------------------------
+# Combining datasets 
+#------------------------
+
+data_all_sites <- bind_rows(
+  get_data_GBM(),
+  get_data_Volta(),
+  get_data_Mahanadi(),
+  get_data_Rhine(),
+  get_data_Humber()
+)
+
+
+# ------------------------------
+# Hazard pair and thresholds
+# ------------------------------
+
+thresholds_df <- data.frame(
+  Area = c("GBM Delta", "GBM Delta", "GBM Delta",
+           "Volta Delta", "Volta Delta", "Volta Delta",
+           "Mahanadi Delta", "Mahanadi Delta", "Mahanadi Delta",
+           "Rhine-Meuse Delta", "Rhine-Meuse Delta", "Rhine-Meuse Delta",
+           "Humber Estuary", "Humber Estuary", "Humber Estuary"),
+  
+  Hazard = c("Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)",
+             "Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)",
+             "Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)",
+             "Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)",
+             "Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)"),
+  var1 = c("river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL"),
+  
+  var2 = c("sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax"),
+  
+  p1 = c(0.92, 0.87, 0.93,
+         0.94, 0.95, 0.75,
+         0.76, 0.90, 0.53,
+         0.93, 0.73, 0.87,
+         0.94, 0.89, 0.87),
+  
+  p2 = c(0.88, 0.94, 0.92,
+         0.95, 0.87, 0.83,
+         0.87, 0.91, 0.88,
+         0.85, 0.95, 0.93,
+         0.84, 0.80, 0.95)
+)
+
+
+
+# -----------
+# FUNCTION
+# -----------
+
+compute_joint_RP_matrix <- function(
+    df,
+    var1,
+    var2,
+    p1,
+    p2,
+    area_name,
+    hazard_name
+){
+  
+
+  df <- df %>%
+    select(Date, all_of(var1), all_of(var2)) %>%
+    na.omit()
+
+  monthly_data <- df %>%
+    mutate(
+      Year  = lubridate::year(Date),
+      Month = lubridate::month(Date)
+    ) %>%
+    group_by(Year, Month) %>%
+    summarise(
+      v1 = max(.data[[var1]], na.rm = TRUE),
+      v2 = max(.data[[var2]], na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  fit1 <- gev.fit(
+    monthly_data$v1,
+    show = FALSE
+  )
+  
+  fit2 <- gev.fit(
+    monthly_data$v2,
+    show = FALSE
+  )
+  
+ 
+  th1 <- quantile(
+    df[[var1]],
+    probs = p1,
+    na.rm = TRUE
+  )
+  
+  th2 <- quantile(
+    df[[var2]],
+    probs = p2,
+    na.rm = TRUE
+  )
+  
+  
+  compound_data <- df %>%
+    filter(
+      .data[[var1]] > th1,
+      .data[[var2]] > th2
+    )
+  
+  if(nrow(compound_data) < 20){
+    
+    warning(
+      paste(
+        "Too few compound events:",
+        area_name,
+        hazard_name
+      )
+    )
+    
+    return(NULL)
+    
+  }
+  
+
+
+n <- nrow(compound_data)
+
+u <- rank(compound_data[[var1]],
+          ties.method = "average") / (n + 1)
+
+v <- rank(compound_data[[var2]],
+          ties.method = "average") / (n + 1)
+
+uv <- cbind(u, v)
+
+uv <- uv[
+  complete.cases(uv),
+]
+
+
+fit_clayton <- fitCopula(
+  claytonCopula(dim = 2),
+  uv,
+  method = "ml"
+)
+
+cop_clayton <- claytonCopula(
+  coef(fit_clayton),
+  dim = 2
+)
+
+
+fit_gumbel <- fitCopula(
+  gumbelCopula(dim = 2),
+  uv,
+  method = "ml"
+)
+
+cop_gumbel <- gumbelCopula(
+  coef(fit_gumbel),
+  dim = 2
+)
+
+
+fit_frank <- fitCopula(
+  frankCopula(dim = 2),
+  uv,
+  method = "ml",
+  start = c(2)
+)
+
+cop_frank <- frankCopula(
+  coef(fit_frank),
+  dim = 2
+)
+
+
+fit_amh <- fitCopula(
+  amhCopula(dim = 2),
+  uv,
+  method = "ml",
+  start = c(0.2)
+)
+
+cop_amh <- amhCopula(
+  coef(fit_amh),
+  dim = 2
+)
+  
+
+
+copula_stats <- data.frame(
+  
+  Area = area_name,
+  
+  Hazard = hazard_name,
+  
+  N = nrow(compound_data),
+  
+  Threshold1 = p1,
+  
+  Threshold2 = p2,
+  
+  Copula = c(
+    "Clayton",
+    "Gumbel",
+    "Frank",
+    "AMH"
+  ),
+  
+  LogLik = c(
+    as.numeric(logLik(fit_clayton)),
+    as.numeric(logLik(fit_gumbel)),
+    as.numeric(logLik(fit_frank)),
+    as.numeric(logLik(fit_amh))
+  ),
+  
+  AIC = c(
+    AIC(fit_clayton),
+    AIC(fit_gumbel),
+    AIC(fit_frank),
+    AIC(fit_amh)
+  ),
+  
+  BIC = c(
+    BIC(fit_clayton),
+    BIC(fit_gumbel),
+    BIC(fit_frank),
+    BIC(fit_amh)
+  )
+  
+)
+
+  models <- list(
+    
+    Clayton = list(
+      fit = fit_clayton,
+      cop = cop_clayton
+    ),
+    
+    Gumbel = list(
+      fit = fit_gumbel,
+      cop = cop_gumbel
+    ),
+    
+    Frank = list(
+      fit = fit_frank,
+      cop = cop_frank
+    ),
+    
+    AMH = list(
+      fit = fit_amh,
+      cop = cop_amh
+    )
+    
+  )
+  
+  best_model <- names(
+    which.min(
+      sapply(
+        models,
+        function(x) AIC(x$fit)
+      )
+    )
+  )
+  
+  cop_fit <- models[[best_model]]$cop
+  
+  qgev_custom <- function(rp, fit){
+    
+    p <- 1 - 1/rp
+    
+    qgev(
+      p,
+      loc   = fit$mle[1],
+      scale = fit$mle[2],
+      shape = fit$mle[3]
+    )
+    
+  }
+  
+
+  RP_vals <- c(
+    5,
+    10,
+    20,
+    25,
+    30,
+    50,
+    100
+  )
+  
+  result <- expand.grid(
+    RP1 = RP_vals,
+    RP2 = RP_vals
+  )
+  
+  result <- result %>%
+    rowwise() %>%
+    mutate(
+      
+      RL1 = qgev_custom(
+        RP1,
+        fit1
+      ),
+      
+      RL2 = qgev_custom(
+        RP2,
+        fit2
+      ),
+      
+      u1 = pgev(
+        RL1,
+        loc = fit1$mle[1],
+        scale = fit1$mle[2],
+        shape = fit1$mle[3]
+      ),
+      
+      u2 = pgev(
+        RL2,
+        loc = fit2$mle[1],
+        scale = fit2$mle[2],
+        shape = fit2$mle[3]
+      ),
+      
+      C_uv = pCopula(
+        c(u1,u2),
+        cop_fit
+      ),
+      
+      joint_prob = pmax(
+        1 - u1 - u2 + C_uv,
+        1e-10
+      ),
+      
+      JointRP = 1 / joint_prob
+      
+    ) %>%
+    ungroup()
+  
+  result$Area <- area_name
+  result$Hazard <- hazard_name
+  result$Copula <- best_model
+  result$N <- nrow(compound_data)  
+  return(
+    list(
+      RP = result,
+      stats = copula_stats,
+      events = compound_data
+    )
+  )
+  
+}
+ 
+
+# ----------------
+# Applications
+# ----------------
+
+all_RP <- data.frame()
+
+copula_summary <- data.frame()
+
+all_compound_events <- data.frame()
+
+for(i in seq_len(nrow(thresholds_df))){
+  
+  row <- thresholds_df[i,]
+  
+  df_area <- data_all_sites %>%
+    filter(
+      Area == row$Area
+    )
+  
+  res <- compute_joint_RP_matrix(
+    
+    df = df_area,
+    
+    var1 = row$var1,
+    
+    var2 = row$var2,
+    
+    p1 = row$p1,
+    
+    p2 = row$p2,
+    
+    area_name = row$Area,
+    
+    hazard_name = row$Hazard
+    
+  )
+  
+  if(is.null(res))
+    next
+  
+  all_RP <- bind_rows(
+    all_RP,
+    res$RP
+  )
+  
+  copula_summary <- bind_rows(
+    copula_summary,
+    res$stats
+  )
+  
+  all_compound_events <- bind_rows(
+    all_compound_events,
+    res$events
+  )
+  
+}
+
+
+# ---------------
+# Visualisation
+# ---------------
+
+
+ggplot(
+  all_RP,
+  aes(
+    x = factor(RP1),
+    y = factor(RP2),
+    fill = JointRP
+  )
+) +
+  
+  geom_tile(color = "white") +
+  
+  geom_text(
+    aes(label = round(JointRP, 0)),
+    color = "white",
+    size = 3.5
+  ) +
+  
+  facet_grid(Area ~ Hazard) +
+  
+  # Add a., b., c., ... to each panel
+  geom_text(
+    data = facet_labels,
+    aes(
+      x = 1,
+      y = Inf,
+      label = panel_label
+    ),
+    inherit.aes = FALSE,
+    hjust = 1,
+    vjust = 1.5,
+    fontface = "bold",
+    size = 4,
+    color = "white"
+  ) +
+  
+  scale_fill_viridis_c(
+    option = "rocket",
+    trans = "log10"
+  ) +
+  
+  coord_equal() +
+  
+  labs(
+    x = "H1 return period (years)",
+    y = "H2 return period (years)",
+    fill = "Joint RP\n(years)"
+  ) +
+  
+  theme_bw() +
+  
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(
+      face = "bold",
+      size = 10.5
+    ),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    ),
+    axis.title = element_text(
+      face = "bold",
+      size = 11
+    ),
+    panel.spacing = unit(0.8, "lines")
+  )
+
+
+
