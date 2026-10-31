@@ -1,0 +1,387 @@
+library(dplyr)
+library(copula)
+library(evd)
+library(ismev)
+library(fields)
+library(readxl)
+library(lubridate)
+library(ggplot2)
+library(reshape2)  
+library(viridis)   
+library(metR)
+library(TideHarmonics)
+library(oce)
+library(extRemes)
+library(purrr)
+
+
+
+
+#------------------------
+# Combining datasets 
+#------------------------
+
+data_all_sites <- bind_rows(
+  get_data_GBM(),
+  get_data_Volta(),
+  get_data_Mahanadi(),
+  get_data_Rhine(),
+  get_data_Humber()
+)
+
+# ------------------------------
+# Hazard pair and thresholds
+# ------------------------------
+
+thresholds_df <- data.frame(
+  Area = c("GBM Delta", "GBM Delta", "GBM Delta",
+           "Volta Delta", "Volta Delta", "Volta Delta",
+           "Mahanadi Delta", "Mahanadi Delta", "Mahanadi Delta",
+           "Rhine-Meuse Delta", "Rhine-Meuse Delta", "Rhine-Meuse Delta",
+           "Humber Estuary", "Humber Estuary", "Humber Estuary"),
+  
+  Hazard = c("Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)",
+             "Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)",
+             "Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)",
+             "Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)",
+             "Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)"),
+  var1 = c("river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL"),
+  
+  var2 = c("sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax"),
+  
+  p1 = c(0.92, 0.87, 0.93,
+         0.94, 0.95, 0.75,
+         0.76, 0.90, 0.53,
+         0.93, 0.73, 0.87,
+         0.94, 0.89, 0.87),
+  
+  p2 = c(0.88, 0.94, 0.92,
+         0.95, 0.87, 0.83,
+         0.87, 0.91, 0.88,
+         0.85, 0.95, 0.93,
+         0.84, 0.80, 0.95)
+)
+
+
+
+# -----------
+# FUNCTION
+# -----------
+
+compute_joint_return_normalised <- function(
+    df,
+    var1,
+    var2,
+    p1,
+    p2,
+    area_name,
+    hazard_name
+){
+  
+
+  
+  df <- df %>%
+    select(
+      Date,
+      all_of(var1),
+      all_of(var2)
+    ) %>%
+    na.omit()
+
+  
+  th1 <- quantile(
+    df[[var1]],
+    probs = p1,
+    na.rm = TRUE
+  )
+  
+  th2 <- quantile(
+    df[[var2]],
+    probs = p2,
+    na.rm = TRUE
+  )
+  
+
+  
+  compound_data <- df %>%
+    filter(
+      .data[[var1]] > th1,
+      .data[[var2]] > th2
+    )
+  
+  if(nrow(compound_data) < 20){
+    
+    warning(
+      paste(
+        "Too few compound events:",
+        area_name,
+        hazard_name
+      )
+    )
+    
+    return(NULL)
+    
+  }
+
+  
+  n <- nrow(compound_data)
+  
+  u <- rank(
+    compound_data[[var1]],
+    ties.method = "average"
+  ) / (n + 1)
+  
+  v <- rank(
+    compound_data[[var2]],
+    ties.method = "average"
+  ) / (n + 1)
+  
+  uv <- cbind(u,v)
+  
+  uv <- uv[
+    complete.cases(uv),
+  ]
+  
+
+  
+  fit_clayton <- fitCopula(
+    claytonCopula(dim = 2),
+    uv,
+    method = "ml"
+  )
+  
+  cop_clayton <- claytonCopula(
+    coef(fit_clayton),
+    dim = 2
+  )
+  
+  fit_gumbel <- fitCopula(
+    gumbelCopula(dim = 2),
+    uv,
+    method = "ml"
+  )
+  
+  cop_gumbel <- gumbelCopula(
+    coef(fit_gumbel),
+    dim = 2
+  )
+  
+  fit_frank <- fitCopula(
+    frankCopula(dim = 2),
+    uv,
+    method = "ml",
+    start = c(2)
+  )
+  
+  cop_frank <- frankCopula(
+    coef(fit_frank),
+    dim = 2
+  )
+  
+  fit_amh <- fitCopula(
+    amhCopula(dim = 2),
+    uv,
+    method = "ml",
+    start = c(0.2)
+  )
+  
+  cop_amh <- amhCopula(
+    coef(fit_amh),
+    dim = 2
+  )
+
+  
+  models <- list(
+    
+    Clayton = list(
+      fit = fit_clayton,
+      cop = cop_clayton
+    ),
+    
+    Gumbel = list(
+      fit = fit_gumbel,
+      cop = cop_gumbel
+    ),
+    
+    Frank = list(
+      fit = fit_frank,
+      cop = cop_frank
+    ),
+    
+    AMH = list(
+      fit = fit_amh,
+      cop = cop_amh
+    )
+    
+  )
+  
+  AIC_values <- sapply(
+    models,
+    function(x) AIC(x$fit)
+  )
+  
+  best_model <- names(
+    which.min(AIC_values)
+  )
+  
+  cop_fit <- models[[best_model]]$cop
+  
+
+  
+  x_seq <- seq(
+    0.001,
+    0.999,
+    length.out = 100
+  )
+  
+  y_seq <- seq(
+    0.001,
+    0.999,
+    length.out = 100
+  )
+  
+  T_joint <- matrix(
+    NA,
+    nrow = length(x_seq),
+    ncol = length(y_seq)
+  )
+  
+  for(i in seq_along(x_seq)){
+    
+    for(j in seq_along(y_seq)){
+      
+      u1 <- x_seq[i]
+      u2 <- y_seq[j]
+      
+      C_uv <- pCopula(
+        c(u1,u2),
+        cop_fit
+      )
+      
+      joint_prob <- pmax(
+        1 - u1 - u2 + C_uv,
+        1e-10
+      )
+      
+      T_joint[i,j] <- 1/joint_prob
+      
+    }
+    
+  }
+
+  
+  T_df <- reshape2::melt(T_joint)
+  
+  names(T_df) <- c(
+    "x_id",
+    "y_id",
+    "ReturnPeriod"
+  )
+  
+  T_df$x_norm <- x_seq[T_df$x_id]
+  
+  T_df$y_norm <- y_seq[T_df$y_id]
+  
+  T_df$Area <- area_name
+  
+  T_df$Hazard <- hazard_name
+  
+  T_df$BestCopula <- best_model
+  
+  T_df$N <- n
+  
+  return(T_df)
+  
+}
+
+# ----------------
+# Applications
+# ----------------
+
+
+all_return <- data.frame()
+
+for(i in seq_len(nrow(thresholds_df))){
+  
+  row <- thresholds_df[i,]
+  
+  df_area <- data_all_sites %>%
+    filter(
+      Area == row$Area
+    )
+  
+  tmp <- compute_joint_return_normalised(
+    
+    df = df_area,
+    
+    var1 = row$var1,
+    var2 = row$var2,
+    
+    p1 = row$p1,
+    p2 = row$p2,
+    
+    area_name = row$Area,
+    hazard_name = row$Hazard
+    
+  )
+  
+  if(is.null(tmp))
+    next
+  
+  all_return <- bind_rows(
+    all_return,
+    tmp
+  )
+  
+}
+
+# ---------------
+# Visualisation
+# ---------------
+
+ggplot(all_return, aes(x = x_norm, y = y_norm, z = ReturnPeriod)) +
+  
+  geom_contour_filled(
+    breaks = c(1, 5, 10, 30, 50, 100, 500, 1000)
+  ) +
+  
+  facet_grid(Area ~ Hazard) +
+  
+  geom_text(
+    data = facet_labels,
+    aes(x = 1, y = Inf, label = panel_label),
+    inherit.aes = FALSE,
+    hjust = 1,
+    vjust = 1,
+    fontface = "bold",
+    size = 4
+  ) +
+  
+  coord_equal() +
+  
+  scale_fill_viridis_d(
+    option = "rocket"
+  ) +
+  
+  labs(
+    x = "Pseudo-observation (H1)",
+    y = "Pseudo-observation (H2)",
+    fill = "Joint return\nperiod (years)"
+  ) +
+  
+  theme_bw() +
+  
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 8),
+    legend.position = "bottom"
+  )
+
