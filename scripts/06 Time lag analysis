@@ -1,0 +1,369 @@
+library(dplyr)
+library(copula)
+library(evd)
+library(ismev)
+library(fields)
+library(readxl)
+library(lubridate)
+library(ggplot2)
+library(reshape2)  
+library(viridis)   
+library(metR)
+library(TideHarmonics)
+library(oce)
+
+
+
+#------------------------
+# Combining datasets 
+#------------------------
+data_all_sites <- bind_rows(
+  get_data_GBM(),
+  get_data_Volta(),
+  get_data_Mahanadi(),
+  get_data_Rhine(),
+  get_data_Humber()
+)
+
+# ------------------------------
+# Hazard pair and thresholds
+# ------------------------------
+hazard_pairs <- list(
+  "Riverine and coastal flood hazard" = c("river_WL", "sea_level"),
+  "Coastal flood and extreme heat"  = c("sea_level", "Tmax"),
+  "Riverine flood and extreme heat"    = c("river_WL", "Tmax")
+)
+
+thresholds_df <- data.frame(
+  Area = c("GBM Delta", "GBM Delta", "GBM Delta",
+           "Volta Delta", "Volta Delta", "Volta Delta",
+           "Mahanadi Delta", "Mahanadi Delta", "Mahanadi Delta",
+           "Rhine-Meuse Delta", "Rhine-Meuse Delta", "Rhine-Meuse Delta",
+           "Humber Estuary", "Humber Estuary", "Humber Estuary"),
+  
+  Hazard = c("Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)",
+             "Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)",
+             "Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)",
+             "Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)",
+             "Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)"),
+  var1 = c("river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL"),
+  
+  var2 = c("sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax"),
+  
+  p1 = c(0.92, 0.87, 0.93,
+         0.94, 0.95, 0.75,
+         0.76, 0.90, 0.53,
+         0.93, 0.73, 0.87,
+         0.94, 0.89, 0.87),
+  
+  p2 = c(0.88, 0.94, 0.92,
+         0.95, 0.87, 0.83,
+         0.87, 0.91, 0.88,
+         0.85, 0.95, 0.93,
+         0.84, 0.80, 0.95)
+)
+
+
+
+
+# -----------
+# FUNCTION
+# -----------
+
+compute_timelag_fixed <- function(df,
+                                  var1,
+                                  var2,
+                                  p1,
+                                  p2,
+                                  lag.max = 365,
+                                  nperm = 1000) {
+  
+
+  
+  df_pair <- df %>%
+    select(Date, all_of(var1), all_of(var2)) %>%
+    filter(!is.na(.data[[var1]]) &
+             !is.na(.data[[var2]]))
+  
+  if(nrow(df_pair) < 10) return(NULL)
+
+
+  th1 <- quantile(
+    df_pair[[var1]],
+    probs = p1,
+    na.rm = TRUE
+  )
+  
+  th2 <- quantile(
+    df_pair[[var2]],
+    probs = p2,
+    na.rm = TRUE
+  )
+
+  
+  df_pair <- df_pair %>%
+    mutate(
+      extreme1 = ifelse(.data[[var1]] >= th1, 1, 0),
+      extreme2 = ifelse(.data[[var2]] >= th2, 1, 0)
+    )
+  
+
+  
+  ccf_res <- ccf(
+    df_pair$extreme1,
+    df_pair$extreme2,
+    lag.max = lag.max,
+    plot = FALSE
+  )
+  
+  lags <- as.numeric(ccf_res$lag)
+  corr <- as.numeric(ccf_res$acf)
+
+  
+  n <- nrow(df_pair)
+  
+  conf95 <- qnorm(0.975) / sqrt(n)
+  
+  significant <- abs(corr) > conf95
+  
+
+  
+  perm_max <- numeric(nperm)
+  
+  for(i in seq_len(nperm)) {
+    
+    perm_series <- sample(df_pair$extreme2)
+    
+    perm_ccf <- ccf(
+      df_pair$extreme1,
+      perm_series,
+      lag.max = lag.max,
+      plot = FALSE
+    )$acf
+    
+    perm_max[i] <- max(abs(perm_ccf))
+  }
+  
+  threshold_perm <- quantile(
+    perm_max,
+    0.95
+  )
+  
+
+  
+  sig_perm <- abs(corr) > threshold_perm
+  
+
+  
+  corr_norm <- (corr - min(corr)) /
+    (max(corr) - min(corr))
+  
+
+  valid <- which(sig_perm)
+  
+  if(length(valid) == 0) {
+    
+    lag_opt <- NA
+    corr_opt <- NA
+    
+  } else {
+    
+    idx <- valid[
+      which.max(corr_norm[valid])
+    ]
+    
+    lag_opt <- lags[idx]
+    corr_opt <- corr[idx]
+    
+  }
+  
+  return(
+    
+    list(
+      
+      df = data.frame(
+        
+        lag_days = lags,
+        
+        corr = corr_norm,
+        
+        corr_raw = corr,
+        
+        significant = significant,
+        
+        significant_perm = sig_perm
+        
+      ),
+      
+      lag_opt_days = lag_opt,
+      
+      corr_opt = corr_opt,
+      
+      conf95 = conf95,
+      
+      perm_threshold = threshold_perm
+      
+    )
+    
+  )
+  
+}
+
+
+results_timelag <- data.frame()
+
+opt_lags <- data.frame()
+
+for(i in 1:nrow(thresholds_df)) {
+  
+  row <- thresholds_df[i, ]
+  
+  df_area <- data_all_sites %>%
+    filter(Area == row$Area)
+  
+  if(!all(c(row$var1, row$var2) %in%
+          colnames(df_area))) next
+  
+  res <- compute_timelag_fixed(
+    df_area,
+    row$var1,
+    row$var2,
+    row$p1,
+    row$p2
+  )
+  
+  if(is.null(res)) next
+  
+  tmp <- res$df
+  tmp$Area <- row$Area
+  tmp$Hazard <- row$Hazard
+  
+  results_timelag <- bind_rows(
+    results_timelag,
+    tmp
+  )
+  
+  opt_lags <- bind_rows(
+    opt_lags,
+    data.frame(
+      Area = row$Area,
+      Hazard = row$Hazard,
+      lag_opt_days = res$lag_opt_days,
+      corr = res$corr_opt,
+      conf95 = res$conf95,
+      perm_threshold = res$perm_threshold
+    )
+  )
+}
+
+opt_lags$label <- paste0(
+  "Lag = ",
+  round(opt_lags$lag_opt_days)
+)
+
+# ---------------
+# Visualisation
+# ---------------
+
+ggplot(
+  results_timelag,
+  aes(
+    x = lag_days,
+    y = corr
+  )
+) +
+  
+  geom_line(
+    color = "grey70"
+  ) +
+  
+  geom_point(
+    data = subset(
+      results_timelag,
+      significant_perm
+    ),
+    colour = "#440154FF",
+    size = 1
+  ) +
+  
+  geom_hline(
+    yintercept = opt_lags$conf95[1],
+    linetype = "dotted",
+    colour = "grey40"
+  ) +
+  
+  geom_hline(
+    yintercept = -opt_lags$conf95[1],
+    linetype = "dotted",
+    colour = "grey40"
+  ) +
+  
+  geom_vline(
+    data = opt_lags,
+    aes(
+      xintercept = lag_opt_days,
+      linetype = "Optimal lag"
+    ),
+    color = "red"
+  ) +
+  geom_text(
+    data = opt_lags,
+    aes(
+      x = lag_opt_days+15,
+      y = 0.95,
+      label = label
+    ),
+    inherit.aes = FALSE,
+    size = 2,
+    hjust = 0,
+    vjust = 1,
+    color = "green"
+
+  )+
+  
+  facet_grid(
+    Area ~ Hazard
+  ) +
+  
+  geom_text(
+    data = facet_labels,
+    aes(
+      x = -Inf,
+      y = Inf,
+      label = panel_label
+    ),
+    inherit.aes = FALSE,
+    hjust = -0.2,
+    vjust = 1.5,
+    fontface = "bold",
+    size = 4
+  ) +
+  
+  scale_linetype_manual(
+    name = "",
+    values = c(
+      "Optimal lag" = "dashed"
+    )
+  ) +
+  
+  labs(
+    x = "Time lag (days)",
+    y = "Normalised cross-correlation"
+  ) +
+  
+  theme_bw()+
+  theme(
+    strip.text = element_text(size = 9.8, face = "bold"),
+    strip.background = element_blank(),
+    axis.text = element_text(size = 8),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    legend.position = "none"
+  )
