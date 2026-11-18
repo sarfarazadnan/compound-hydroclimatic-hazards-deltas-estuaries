@@ -1,0 +1,190 @@
+library(dplyr)
+library(purrr)
+library(copula)
+library(evd)
+library(ismev)
+library(fields)
+library(readxl)
+library(lubridate)
+library(ggplot2)
+library(reshape2)  
+library(viridis)   
+library(metR)
+library(TideHarmonics)
+library(oce)
+
+
+
+#------------------------
+# Combining datasets 
+#------------------------
+
+data_all_sites <- bind_rows(
+  get_data_GBM(),
+  get_data_Volta(),
+  get_data_Mahanadi(),
+  get_data_Rhine(),
+  get_data_Humber()
+)
+
+#-----------------------------------
+#Functions
+#-----------------------------------
+
+data_all_sites_anom <- data_all_sites %>%
+  
+  mutate(
+    Month = lubridate::month(Date)
+  ) %>%
+  
+  group_by(Area, Month) %>%
+  
+  mutate(
+    
+    river_WL =
+      river_WL -
+      mean(river_WL, na.rm = TRUE),
+    
+    sea_level =
+      sea_level -
+      mean(sea_level, na.rm = TRUE),
+    
+    Tmax =
+      Tmax -
+      mean(Tmax, na.rm = TRUE)
+    
+  ) %>%
+  
+  ungroup() %>%
+  
+  select(
+    Date,
+    river_WL,
+    sea_level,
+    Tmax,
+    Area
+  )
+
+
+results_all_anom <- data.frame()
+best_all_anom <- data.frame()
+cv_all_anom <- data.frame()
+cv_summary_all_anom <- data.frame()
+
+for(area in unique(data_all_sites_anom$Area)) {
+  
+  df <- data_all_sites_anom %>%
+    filter(Area == area)
+  
+  rc <- analyze_RC(df)
+  ch <- analyze_CH(df)
+  rh <- analyze_RH(df)
+  
+  tmp_results <- bind_rows(
+    rc$results,
+    ch$results,
+    rh$results
+  ) %>%
+    mutate(Area = area)
+  
+  tmp_best <- bind_rows(
+    rc$best,
+    ch$best,
+    rh$best
+  ) %>%
+    mutate(Area = area)
+  
+  tmp_cv <- bind_rows(
+    rc$cv_results,
+    ch$cv_results,
+    rh$cv_results
+  ) %>%
+    mutate(Area = area)
+  
+  tmp_cv_summary <- bind_rows(
+    rc$cv_summary,
+    ch$cv_summary,
+    rh$cv_summary
+  )
+  
+  tmp_cv_summary$Hazard <- c(
+    "Riverine and coastal flood hazard",
+    "Coastal flood and extreme heat",
+    "Riverine flood and extreme heat"
+  )
+  
+  tmp_cv_summary$Area <- area
+  
+  results_all_anom <-
+    bind_rows(
+      results_all_anom,
+      tmp_results
+    )
+  
+  best_all_anom <-
+    bind_rows(
+      best_all_anom,
+      tmp_best
+    )
+  
+  cv_all_anom <-
+    bind_rows(
+      cv_all_anom,
+      tmp_cv
+    )
+  
+  cv_summary_all_anom <-
+    bind_rows(
+      cv_summary_all_anom,
+      tmp_cv_summary
+    )
+  
+}
+
+
+
+tau_comparison <-
+  
+  best_all %>%
+  
+  select(
+    Area,
+    Hazard,
+    tau_original = tau,
+    p1_original = p1,
+    p2_original = p2
+  ) %>%
+  
+  left_join(
+    
+    best_all_anom %>%
+      select(
+        Area,
+        Hazard,
+        tau_anomaly = tau,
+        p1_anomaly = p1,
+        p2_anomaly = p2
+      ),
+    
+    by = c(
+      "Area",
+      "Hazard"
+    )
+    
+  ) %>%
+  
+  mutate(
+    
+    tau_change =
+      tau_anomaly -
+      tau_original,
+    
+    percent_change =
+      100 *
+      (tau_anomaly - tau_original) /
+      abs(tau_original)
+    
+  )
+
+tau_comparison
+
