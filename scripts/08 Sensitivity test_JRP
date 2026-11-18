@@ -1,0 +1,556 @@
+library(dplyr)
+library(copula)
+library(evd)
+library(ismev)
+library(fields)
+library(readxl)
+library(lubridate)
+library(ggplot2)
+library(reshape2)  
+library(viridis)   
+library(metR)
+library(TideHarmonics)
+library(oce)
+library(extRemes)
+library(purrr)
+
+
+# =====================================================
+# datasets 
+# =====================================================
+
+data_all_sites <- read.csv("data_all_sites.csv")
+data_all_sites$Date <- as.Date(data_all_sites$Date)
+
+data_all_sites_anom <- read.csv("data_all_sites_anom.csv")
+data_all_sites_anom$Date <- as.Date(data_all_sites_anom$Date)
+
+# =====================================================
+# Thresholds 
+# =====================================================
+
+thresholds_df <- data.frame(
+  Area = c("GBM Delta", "GBM Delta", "GBM Delta",
+           "Volta Delta", "Volta Delta", "Volta Delta",
+           "Mahanadi Delta", "Mahanadi Delta", "Mahanadi Delta",
+           "Rhine-Meuse Delta", "Rhine-Meuse Delta", "Rhine-Meuse Delta",
+           "Humber Estuary", "Humber Estuary", "Humber Estuary"),
+  
+  Hazard = c("Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)",
+             "Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)",
+             "Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)",
+             "Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)",
+             "Riverine(H1)-coastal(H2) flood", "Coastal flood(H1)-extreme heat(H2)", "Riverine flood(H1)-extreme heat(H2)"),
+  var1 = c("river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL",
+           "river_WL","sea_level","river_WL"),
+  
+  var2 = c("sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax",
+           "sea_level","Tmax","Tmax"),
+  
+  p1 = c(0.92, 0.87, 0.93,
+         0.94, 0.95, 0.75,
+         0.76, 0.90, 0.53,
+         0.93, 0.73, 0.87,
+         0.94, 0.89, 0.87),
+  
+  p2 = c(0.88, 0.94, 0.92,
+         0.95, 0.87, 0.83,
+         0.87, 0.91, 0.88,
+         0.85, 0.95, 0.93,
+         0.84, 0.80, 0.95)
+)
+
+
+
+# =====================================================
+# FUNCTION
+# =====================================================
+
+compute_joint_RP_matrix <- function(
+    df,
+    var1,
+    var2,
+    p1,
+    p2,
+    area_name,
+    hazard_name
+){
+
+  
+  df <- df %>%
+    select(Date, all_of(var1), all_of(var2)) %>%
+    na.omit()
+
+  
+  monthly_data <- df %>%
+    mutate(
+      Year  = lubridate::year(Date),
+      Month = lubridate::month(Date)
+    ) %>%
+    group_by(Year, Month) %>%
+    summarise(
+      v1 = max(.data[[var1]], na.rm = TRUE),
+      v2 = max(.data[[var2]], na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  fit1 <- gev.fit(
+    monthly_data$v1,
+    show = FALSE
+  )
+  
+  fit2 <- gev.fit(
+    monthly_data$v2,
+    show = FALSE
+  )
+  
+
+  
+  th1 <- quantile(
+    df[[var1]],
+    probs = p1,
+    na.rm = TRUE
+  )
+  
+  th2 <- quantile(
+    df[[var2]],
+    probs = p2,
+    na.rm = TRUE
+  )
+  
+
+  
+  compound_data <- df %>%
+    filter(
+      .data[[var1]] > th1,
+      .data[[var2]] > th2
+    )
+  
+  if(nrow(compound_data) < 20){
+    
+    warning(
+      paste(
+        "Too few compound events:",
+        area_name,
+        hazard_name
+      )
+    )
+    
+    return(NULL)
+    
+  }
+  
+
+n <- nrow(compound_data)
+
+u <- rank(compound_data[[var1]],
+          ties.method = "average") / (n + 1)
+
+v <- rank(compound_data[[var2]],
+          ties.method = "average") / (n + 1)
+
+uv <- cbind(u, v)
+
+uv <- uv[
+  complete.cases(uv),
+]
+
+
+
+fit_clayton <- fitCopula(
+  claytonCopula(dim = 2),
+  uv,
+  method = "ml"
+)
+
+cop_clayton <- claytonCopula(
+  coef(fit_clayton),
+  dim = 2
+)
+
+
+fit_gumbel <- fitCopula(
+  gumbelCopula(dim = 2),
+  uv,
+  method = "ml"
+)
+
+cop_gumbel <- gumbelCopula(
+  coef(fit_gumbel),
+  dim = 2
+)
+
+
+fit_frank <- tryCatch(
+  
+  fitCopula(
+    frankCopula(dim = 2),
+    uv,
+    method = "ml",
+    start = c(2)
+  ),
+  
+  error = function(e) NULL
+  
+)
+
+cop_frank <- frankCopula(
+  coef(fit_frank),
+  dim = 2
+)
+
+
+
+fit_amh <- tryCatch(
+  
+  fitCopula(
+    amhCopula(dim = 2),
+    uv,
+    method = "ml",
+    start = c(0.2)
+  ),
+  
+  error = function(e) NULL
+  
+)
+
+cop_amh <- amhCopula(
+  coef(fit_amh),
+  dim = 2
+)
+  
+
+models <- list()
+
+models$Clayton <- list(
+  fit = fit_clayton,
+  cop = cop_clayton
+)
+
+models$Gumbel <- list(
+  fit = fit_gumbel,
+  cop = cop_gumbel
+)
+
+if(!is.null(fit_frank))
+  models$Frank <- list(
+    fit = fit_frank,
+    cop = cop_frank
+  )
+
+if(!is.null(fit_amh))
+  models$AMH <- list(
+    fit = fit_amh,
+    cop = cop_amh
+  )
+
+copula_stats <- data.frame(
+  
+  Copula = names(models),
+  
+  LogLik = sapply(
+    models,
+    function(x)
+      as.numeric(logLik(x$fit))
+  ),
+  
+  AIC = sapply(
+    models,
+    function(x)
+      AIC(x$fit)
+  ),
+  
+  BIC = sapply(
+    models,
+    function(x)
+      BIC(x$fit)
+  )
+  
+)
+
+  
+  models <- list(
+    
+    Clayton = list(
+      fit = fit_clayton,
+      cop = cop_clayton
+    ),
+    
+    Gumbel = list(
+      fit = fit_gumbel,
+      cop = cop_gumbel
+    ),
+    
+    Frank = list(
+      fit = fit_frank,
+      cop = cop_frank
+    ),
+    
+    AMH = list(
+      fit = fit_amh,
+      cop = cop_amh
+    )
+    
+  )
+  
+best_model <- copula_stats$Copula[
+  which.min(
+    copula_stats$AIC
+  )
+]
+  
+  cop_fit <- models[[best_model]]$cop
+  
+  qgev_custom <- function(rp, fit){
+    
+    p <- 1 - 1/rp
+    
+    qgev(
+      p,
+      loc   = fit$mle[1],
+      scale = fit$mle[2],
+      shape = fit$mle[3]
+    )
+    
+  }
+  
+
+  RP_vals <- c(
+    5,
+    10,
+    20,
+    25,
+    30,
+    50,
+    100
+  )
+  
+  result <- expand.grid(
+    RP1 = RP_vals,
+    RP2 = RP_vals
+  )
+  
+  result <- result %>%
+    rowwise() %>%
+    mutate(
+      
+      RL1 = qgev_custom(
+        RP1,
+        fit1
+      ),
+      
+      RL2 = qgev_custom(
+        RP2,
+        fit2
+      ),
+      
+      u1 = pgev(
+        RL1,
+        loc = fit1$mle[1],
+        scale = fit1$mle[2],
+        shape = fit1$mle[3]
+      ),
+      
+      u2 = pgev(
+        RL2,
+        loc = fit2$mle[1],
+        scale = fit2$mle[2],
+        shape = fit2$mle[3]
+      ),
+      
+      C_uv = pCopula(
+        c(u1,u2),
+        cop_fit
+      ),
+      
+      joint_prob = pmax(
+        1 - u1 - u2 + C_uv,
+        1e-10
+      ),
+      
+      JointRP = 1 / joint_prob
+      
+    ) %>%
+    ungroup()
+  
+  result$Area <- area_name
+  result$Hazard <- hazard_name
+  result$Copula <- best_model
+  result$N <- nrow(compound_data)  
+  return(
+    list(
+      RP = result,
+      stats = copula_stats,
+      events = compound_data
+    )
+  )
+  
+}
+ 
+extract_JRP_summary <- function(
+    df,
+    var1,
+    var2,
+    p1,
+    p2,
+    area_name,
+    hazard_name
+){
+  
+  res <- compute_joint_RP_matrix(
+    df = df,
+    var1 = var1,
+    var2 = var2,
+    p1 = p1,
+    p2 = p2,
+    area_name = area_name,
+    hazard_name = hazard_name
+  )
+  
+  if(is.null(res))
+    return(NULL)
+  
+  jrp_5x5 <- res$RP %>%
+    filter(
+      RP1 == 5,
+      RP2 == 5
+    )
+  
+  data.frame(
+    Area = area_name,
+    Hazard = hazard_name,
+    Copula = as.character(
+      jrp_5x5$Copula[1]
+    ),
+    JRP_5x5 = as.numeric(
+      jrp_5x5$JointRP[1]
+    )
+  )
+  
+}
+
+
+JRP_original <- data.frame()
+
+for(i in seq_len(nrow(thresholds_df))){
+  
+  row <- thresholds_df[i,]
+  
+  df_area <- data_all_sites %>%
+    filter(
+      Area == row$Area
+    )
+  
+  tmp <- extract_JRP_summary(
+    
+    df = df_area,
+    
+    var1 = row$var1,
+    
+    var2 = row$var2,
+    
+    p1 = row$p1,
+    
+    p2 = row$p2,
+    
+    area_name = row$Area,
+    
+    hazard_name = row$Hazard
+    
+  )
+  
+  if(is.null(tmp))
+    next
+  
+  JRP_original <- bind_rows(
+    JRP_original,
+    tmp
+  )
+  
+}
+
+JRP_anomaly <- data.frame()
+
+for(i in seq_len(nrow(thresholds_df))){
+  
+  row <- thresholds_df[i,]
+  
+  df_area <- data_all_sites_anom %>%
+    filter(
+      Area == row$Area
+    )
+  
+  tmp <- extract_JRP_summary(
+    
+    df = df_area,
+    
+    var1 = row$var1,
+    
+    var2 = row$var2,
+    
+    p1 = row$p1,
+    
+    p2 = row$p2,
+    
+    area_name = row$Area,
+    
+    hazard_name = row$Hazard
+    
+  )
+  
+  if(is.null(tmp))
+    next
+  
+  JRP_anomaly <- bind_rows(
+    JRP_anomaly,
+    tmp
+  )
+  
+}
+
+JRP_sensitivity <-
+  
+  JRP_original %>%
+  
+  rename(
+    Copula_original = Copula,
+    JRP_original = JRP_5x5
+  ) %>%
+  
+  left_join(
+    
+    JRP_anomaly %>%
+      
+      rename(
+        Copula_anomaly = Copula,
+        JRP_anomaly = JRP_5x5
+      ),
+    
+    by = c(
+      "Area",
+      "Hazard"
+    )
+    
+  ) %>%
+  
+  mutate(
+    
+    JRP_change =
+      JRP_anomaly -
+      JRP_original,
+    
+    JRP_percent_change =
+      100 *
+      (JRP_anomaly -
+         JRP_original) /
+      JRP_original
+    
+  )
+
+
